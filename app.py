@@ -1,19 +1,23 @@
 import torch
 import torch.nn as nn
-from flask import Flask, request, render_template_string
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from PIL import Image
 from torchvision import transforms
+import io
 
-app = Flask(__name__)
+app = FastAPI(title="MNIST CNN API", version="1.0")
 
+# -----------------------------
+# CNN architecture
+# -----------------------------
 class CNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(1, 32, 3),
+            nn.Conv2d(1, 32, kernel_size=3),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3),
+            nn.Conv2d(32, 64, kernel_size=3),
             nn.ReLU(),
             nn.MaxPool2d(2)
         )
@@ -28,66 +32,73 @@ class CNN(nn.Module):
     def forward(self, x):
         return self.classifier(self.features(x))
 
+
+# -----------------------------
+# Load saved model
+# -----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MODEL_PATH = "mnist_cnn.pth"
+
 model = CNN().to(device)
-model.load_state_dict(torch.load("mnist_cnn.pth", map_location=device))
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
 
+# Same preprocessing used for MNIST
 transform = transforms.Compose([
-    transforms.Grayscale(1),
+    transforms.Grayscale(num_output_channels=1),
     transforms.Resize((28, 28)),
     transforms.ToTensor()
 ])
 
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>MNIST CNN Classifier</title>
-<style>
-body { font-family: Arial; text-align:center; margin-top:50px; }
-.box { width:500px; margin:auto; padding:30px; border:1px solid #ddd; border-radius:10px; }
-button { padding:10px 25px; margin-top:15px; cursor:pointer; }
-.result { font-size:28px; font-weight:bold; margin-top:20px; }
-</style>
-</head>
-<body>
-<div class="box">
-<h1>MNIST CNN Classifier</h1>
-<form method="POST" enctype="multipart/form-data">
-<input type="file" name="image" accept="image/*" required><br>
-<button type="submit">Predict Digit</button>
-</form>
-{% if prediction is not none %}
-<div class="result">Predicted Digit: {{ prediction }}</div>
-<p>Confidence: {{ confidence }}%</p>
-{% endif %}
-</div>
-</body>
-</html>
-"""
 
-@app.route("/", methods=["GET", "POST"])
-def predict():
-    prediction = None
-    confidence = None
+# -----------------------------
+# API endpoints
+# -----------------------------
+@app.get("/")
+def home():
+    return {
+        "message": "MNIST CNN API is running",
+        "endpoint": "/predict"
+    }
 
-    if request.method == "POST":
-        file = request.files["image"]
-        image = Image.open(file).convert("L")
-        image = transform(image).unsqueeze(0).to(device)
 
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    try:
+        # Read uploaded image
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents)).convert("L")
+
+        # Preprocess
+        image_tensor = transform(image)
+        image_tensor = image_tensor.unsqueeze(0).to(device)
+
+        # Prediction
         with torch.no_grad():
-            output = model(image)
+            output = model(image_tensor)
             probabilities = torch.softmax(output, dim=1)
-            predicted = torch.argmax(probabilities, dim=1).item()
-            confidence = round(probabilities[0, predicted].item() * 100, 2)
 
-        prediction = predicted
+            predicted_digit = torch.argmax(
+                probabilities, dim=1
+            ).item()
 
-    return render_template_string(
-        HTML, prediction=prediction, confidence=confidence
-    )
+            confidence = probabilities[
+                0, predicted_digit
+            ].item() * 100
+
+        return {
+            "predicted_digit": predicted_digit,
+            "confidence": round(confidence, 2)
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not process image: {str(e)}"
+        )
+
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
